@@ -3,8 +3,8 @@ package main
 import (
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -19,20 +19,27 @@ import (
 )
 
 const (
-	canvasWidth     = 40
-	canvasHeight    = 20
-	pixelRateLimit  = 10 * time.Second
+	pixelRateLimit  = 1 * time.Second
 	batchUpdateRate = 100 * time.Millisecond
+	chunkSize       = int16(256)
 )
+
+type Location struct {
+	X, Y int16
+}
 
 type Pixel struct {
 	R, G, B uint8
 }
 
+type Chunk struct {
+	X, Y   int16
+	Pixels [chunkSize][chunkSize]Pixel
+}
+
 var (
-	canvas      [canvasHeight][canvasWidth]Pixel
-	canvasMutex sync.RWMutex
-	lastPlaced  = map[string]time.Time{}
+	chunks     = []*Chunk{}
+	lastPlaced = map[string]time.Time{}
 )
 
 type mode int
@@ -43,25 +50,16 @@ const (
 )
 
 type model struct {
-	cursorX, cursorY int
-	username         string
-	lastMessage      string
-	currentMode      mode
-	colorInput       textinput.Model
-}
-
-type pixelUpdateMsg struct {
-	X, Y  int
-	Color Pixel
+	cursor        Location
+	width, height int16
+	username      string
+	lastMessage   string
+	currentMode   mode
+	colorInput    textinput.Model
+	countPrepend  int16
 }
 
 func main() {
-	for y := range canvasHeight {
-		for x := range canvasWidth {
-			canvas[y][x] = Pixel{0, 0, 0}
-		}
-	}
-
 	srv, err := wish.NewServer(
 		wish.WithAddress(":2222"),
 		wish.WithHostKeyPath(".ssh/term_key"),
@@ -84,6 +82,73 @@ func main() {
 	}
 }
 
+func getChunk(x int16, y int16) *Chunk {
+	chunkX := int16(x / chunkSize)
+	chunkY := int16(y / chunkSize)
+	fmt.Println("Looking for chunk at", chunkX, chunkY)
+	for _, c := range chunks {
+		if c.X == chunkX && c.Y == chunkY {
+			return c
+		}
+	}
+	fmt.Println("Chunk not found, creating new one at", chunkX, chunkY)
+	newChunk := &Chunk{
+		X:      chunkX,
+		Y:      chunkY,
+		Pixels: [chunkSize][chunkSize]Pixel{},
+	}
+	chunks = append(chunks, newChunk)
+	return newChunk
+}
+
+func buildCanvas(center Location, width int16, height int16) [][]Pixel {
+	fmt.Printf("Building canvas at center (%d, %d) with width %d and height %d\n", center.X, center.Y, width, height)
+	lx := center.X - width/2
+	by := center.Y - height/2
+
+	// Collect all the chunks needed
+	chunkWidth := int16(width/chunkSize) + 1
+	chunkHeight := int16(height/chunkSize) + 1
+	canvasChunks := make([][]*Chunk, chunkWidth)
+	for x := int16(0); x < chunkWidth; x++ {
+		canvasChunks[x] = make([]*Chunk, chunkHeight)
+		for y := int16(0); y < chunkHeight; y++ {
+			cx := lx + x*chunkSize
+			cy := by + y*chunkSize
+			fmt.Println("Fetching chunk at", cx, cy)
+			canvasChunks[x][y] = getChunk(cx, cy)
+		}
+	}
+
+	// Build pixel grid
+	canvas := make([][]Pixel, width)
+	for canvasX := int16(0); canvasX < width; canvasX++ {
+		canvas[canvasX] = make([]Pixel, height)
+		for canvasY := int16(0); canvasY < height; canvasY++ {
+			worldX := lx + canvasX
+			worldY := by + canvasY
+
+			// Wrap into chunk-relative coords
+			pixelX := (worldX%chunkSize + chunkSize) % chunkSize
+			pixelY := (worldY%chunkSize + chunkSize) % chunkSize
+
+			chunkX := (worldX / chunkSize) - (lx / chunkSize)
+			chunkY := (worldY / chunkSize) - (by / chunkSize)
+
+			canvas[canvasX][canvasY] = canvasChunks[chunkX][chunkY].Pixels[pixelX][pixelY]
+		}
+	}
+	return canvas
+}
+
+func setPixel(l Location, p Pixel) {
+	fmt.Println("Setting pixel at", l, "to", p)
+	chunk := getChunk(l.X, l.Y)
+	chunkX := (l.X%chunkSize + chunkSize) % chunkSize
+	chunkY := (l.Y%chunkSize + chunkSize) % chunkSize
+	chunk.Pixels[chunkX][chunkY] = p
+}
+
 func tuiHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 	var username string
 	if pk := s.PublicKey(); pk != nil {
@@ -102,6 +167,9 @@ func tuiHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 		username:    username,
 		currentMode: modeCanvas,
 		colorInput:  ti,
+		width:       80, // Default width
+		height:      24, // Default height
+		cursor:      Location{X: 0, Y: 0},
 	}
 
 	progOpts := []tea.ProgramOption{tea.WithAltScreen()}
@@ -127,17 +195,17 @@ func (m model) View() string {
 }
 
 func (m model) viewCanvas() string {
-	canvasMutex.RLock()
-	defer canvasMutex.RUnlock()
-
 	var b strings.Builder
-	for y := range canvasHeight {
-		for x := range canvasWidth {
-			p := canvas[y][x]
-			style := lipgloss.NewStyle().Background(lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", p.R, p.G, p.B)))
+	canvas := buildCanvas(m.cursor, m.width, m.height)
+	for y := int16(0); y < m.height; y++ {
+		for x := int16(0); x < m.width; x++ {
+			p := canvas[x][y]
+			style := lipgloss.NewStyle().Background(
+				lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", p.R, p.G, p.B)),
+			)
 			char := "  "
-			if m.cursorX == x && m.cursorY == y {
-				style = style.Foreground(lipgloss.Color("#ffffff")).Background(lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", p.R, p.G, p.B)))
+			if x == int16(m.width/2) && y == int16(m.height/2) {
+				style = style.Foreground(lipgloss.Color("#ffffff"))
 				char = "[]"
 			}
 			b.WriteString(style.Render(char))
@@ -162,7 +230,7 @@ func (m model) viewColorPicker() string {
 
 	box := lipgloss.JoinHorizontal(lipgloss.Top, m.colorInput.View(), " ", preview)
 	dialog := lipgloss.Place(
-		canvasWidth*2, canvasHeight+2,
+		int(m.width*2), int(m.height+4),
 		lipgloss.Center, lipgloss.Center,
 		lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(1).Render(
 			"Pick color (#RRGGBB):\n"+box+"\nPress Enter to confirm, Esc to cancel.",
@@ -182,28 +250,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updateCanvas(msg tea.Msg) (tea.Model, tea.Cmd) {
+	count := m.countPrepend
+	if count == 0 {
+		count = 1
+	}
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		case "0", "1", "2", "3", "4", "5", "6", "7", "8", "9":
+			num, _ := strconv.Atoi(msg.String())
+			m.countPrepend = m.countPrepend*10 + int16(num)
 		case "h", "left":
-			if m.cursorX > 0 {
-				m.cursorX--
-			}
+			m.cursor.X -= count
+			m.countPrepend = 0
 		case "l", "right":
-			if m.cursorX < canvasWidth-1 {
-				m.cursorX++
-			}
+			m.cursor.X += count
+			m.countPrepend = 0
 		case "k", "up":
-			if m.cursorY > 0 {
-				m.cursorY--
-			}
+			m.cursor.Y -= count
+			m.countPrepend = 0
 		case "j", "down":
-			if m.cursorY < canvasHeight-1 {
-				m.cursorY++
-			}
+			m.cursor.Y += count
+			m.countPrepend = 0
 		case " ", "enter":
+			m.countPrepend = 0
 			now := time.Now()
 			if last, ok := lastPlaced[m.username]; ok && now.Sub(last) < pixelRateLimit {
 				remaining := pixelRateLimit - now.Sub(last)
@@ -213,10 +285,8 @@ func (m model) updateCanvas(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.currentMode = modeColorPicker
 			m.colorInput.SetValue("#")
 		}
-	case pixelUpdateMsg:
-		canvasMutex.Lock()
-		canvas[msg.Y][msg.X] = msg.Color
-		canvasMutex.Unlock()
+	case tea.WindowSizeMsg:
+		m.width, m.height = int16(msg.Width/2), int16(msg.Height-1)
 	}
 	return m, nil
 }
@@ -232,9 +302,7 @@ func (m model) updateColorPicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 			val := m.colorInput.Value()
 			if len(val) == 7 && val[0] == '#' {
 				r, g, b := hexToRGB(val)
-				canvasMutex.Lock()
-				canvas[m.cursorY][m.cursorX] = Pixel{r, g, b}
-				canvasMutex.Unlock()
+				setPixel(m.cursor, Pixel{r, g, b})
 				lastPlaced[m.username] = time.Now()
 				m.lastMessage = ""
 				m.currentMode = modeCanvas
@@ -243,6 +311,8 @@ func (m model) updateColorPicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.currentMode = modeCanvas
 			}
 		}
+	case tea.WindowSizeMsg:
+		m.width, m.height = int16(msg.Width/2), int16(msg.Height-1)
 	}
 	m.colorInput, cmd = m.colorInput.Update(msg)
 	return m, cmd
