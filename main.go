@@ -63,6 +63,10 @@ func tick() tea.Cmd {
 }
 
 func main() {
+	// Restore from backup if available
+	restoreBackup()
+	// Start the backup worker
+	go backupWorker()
 	srv, err := wish.NewServer(
 		wish.WithAddress(":2222"),
 		wish.WithHostKeyPath(".ssh/term_key"),
