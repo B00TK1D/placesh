@@ -56,10 +56,7 @@ func (m model) viewColorPicker() string {
 	if s := m.colorInput.Value(); len(s) == 6 {
 		col = s
 	}
-	preview := lipgloss.NewStyle().
-		Background(lipgloss.Color("#" + col)).
-		Width(2).Height(1).
-		Render("[]")
+	preview := fmt.Sprintf("\033[48;5;%dm[]\033[0m", rgbToAnsi(hexToRGB(col)))
 
 	canvas := m.viewCanvas()
 

@@ -16,9 +16,9 @@ import (
 )
 
 const (
-	pixelRateLimit  = 1 * time.Second
-	batchUpdateRate = 100 * time.Millisecond
-	chunkSize       = int16(256)
+	port           = ":2222"
+	pixelRateLimit = 1 * time.Second
+	chunkSize      = int16(256)
 )
 
 type Location struct {
@@ -63,12 +63,10 @@ func tick() tea.Cmd {
 }
 
 func main() {
-	// Restore from backup if available
 	restoreBackup()
-	// Start the backup worker
 	go backupWorker()
 	srv, err := wish.NewServer(
-		wish.WithAddress(":2222"),
+		wish.WithAddress(port),
 		wish.WithHostKeyPath(".ssh/term_key"),
 		wish.WithPublicKeyAuth(func(ctx ssh.Context, key ssh.PublicKey) bool {
 			return true
@@ -83,7 +81,7 @@ func main() {
 		log.Fatalf("failed to create SSH server: %v", err)
 	}
 
-	log.Printf("Starting SSH r/place on :2222 ...")
+	log.Printf("Starting SSH r/place on %s ...", port)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalln(err)
 	}
@@ -113,7 +111,6 @@ func buildCanvas(center Location, width int16, height int16) [][]Pixel {
 	lx := center.X - width/2
 	by := center.Y - height/2
 
-	// Collect all the chunks needed
 	chunkWidth := int16(width/chunkSize) + 1
 	chunkHeight := int16(height/chunkSize) + 1
 	canvasChunks := make([][]*Chunk, chunkWidth)
@@ -127,7 +124,6 @@ func buildCanvas(center Location, width int16, height int16) [][]Pixel {
 		}
 	}
 
-	// Build pixel grid
 	canvas := make([][]Pixel, width)
 	for canvasX := range width {
 		canvas[canvasX] = make([]Pixel, height)
@@ -135,7 +131,6 @@ func buildCanvas(center Location, width int16, height int16) [][]Pixel {
 			worldX := lx + canvasX
 			worldY := by + canvasY
 
-			// Wrap into chunk-relative coords
 			pixelX := (worldX%chunkSize + chunkSize) % chunkSize
 			pixelY := (worldY%chunkSize + chunkSize) % chunkSize
 
@@ -174,10 +169,10 @@ func tuiHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 	m := model{
 		username:    username,
 		currentMode: modeCanvas,
-		message:     "(0, 0)",
+		message:     "Hint: Navigate with hjkl or arrow keys, place pixels with space/enter, and exit with esc/q.",
 		colorInput:  ti,
-		width:       80, // Default width
-		height:      24, // Default height
+		width:       80,
+		height:      24,
 		cursor:      Location{X: 0, Y: 0},
 	}
 
