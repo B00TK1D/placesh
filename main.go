@@ -3,13 +3,10 @@ package main
 import (
 	"fmt"
 	"log"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/ssh"
 	"github.com/charmbracelet/wish"
 	"github.com/charmbracelet/wish/activeterm"
@@ -28,9 +25,7 @@ type Location struct {
 	X, Y int16
 }
 
-type Pixel struct {
-	R, G, B uint8
-}
+type Pixel uint8
 
 type Chunk struct {
 	X, Y   int16
@@ -53,10 +48,18 @@ type model struct {
 	cursor        Location
 	width, height int16
 	username      string
-	lastMessage   string
+	message       string
 	currentMode   mode
 	colorInput    textinput.Model
 	countPrepend  int16
+}
+
+type tickMsg time.Time
+
+func tick() tea.Cmd {
+	return tea.Tick(time.Second*5, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
 }
 
 func main() {
@@ -110,9 +113,9 @@ func buildCanvas(center Location, width int16, height int16) [][]Pixel {
 	chunkWidth := int16(width/chunkSize) + 1
 	chunkHeight := int16(height/chunkSize) + 1
 	canvasChunks := make([][]*Chunk, chunkWidth)
-	for x := int16(0); x < chunkWidth; x++ {
+	for x := range chunkWidth {
 		canvasChunks[x] = make([]*Chunk, chunkHeight)
-		for y := int16(0); y < chunkHeight; y++ {
+		for y := range chunkHeight {
 			cx := lx + x*chunkSize
 			cy := by + y*chunkSize
 			fmt.Println("Fetching chunk at", cx, cy)
@@ -122,9 +125,9 @@ func buildCanvas(center Location, width int16, height int16) [][]Pixel {
 
 	// Build pixel grid
 	canvas := make([][]Pixel, width)
-	for canvasX := int16(0); canvasX < width; canvasX++ {
+	for canvasX := range width {
 		canvas[canvasX] = make([]Pixel, height)
-		for canvasY := int16(0); canvasY < height; canvasY++ {
+		for canvasY := range height {
 			worldX := lx + canvasX
 			worldY := by + canvasY
 
@@ -158,14 +161,16 @@ func tuiHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 	}
 
 	ti := textinput.New()
-	ti.Placeholder = "#000000"
+	ti.Placeholder = "000000"
 	ti.Focus()
-	ti.CharLimit = 7
-	ti.Width = 8
+	ti.CharLimit = 6
+	ti.Width = 6
+	ti.Prompt = "#"
 
 	m := model{
 		username:    username,
 		currentMode: modeCanvas,
+		message:     "(0, 0)",
 		colorInput:  ti,
 		width:       80, // Default width
 		height:      24, // Default height
@@ -180,146 +185,5 @@ func tuiHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 var teaProgramPlaceholder *tea.Program
 
 func (m model) Init() tea.Cmd {
-	return nil
-}
-
-func (m model) View() string {
-	switch m.currentMode {
-	case modeCanvas:
-		return m.viewCanvas()
-	case modeColorPicker:
-		return m.viewColorPicker()
-	default:
-		return ""
-	}
-}
-
-func (m model) viewCanvas() string {
-	var b strings.Builder
-	canvas := buildCanvas(m.cursor, m.width, m.height)
-	for y := int16(0); y < m.height; y++ {
-		for x := int16(0); x < m.width; x++ {
-			p := canvas[x][y]
-			style := lipgloss.NewStyle().Background(
-				lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", p.R, p.G, p.B)),
-			)
-			char := "  "
-			if x == int16(m.width/2) && y == int16(m.height/2) {
-				style = style.Foreground(lipgloss.Color("#ffffff"))
-				char = "[]"
-			}
-			b.WriteString(style.Render(char))
-		}
-		b.WriteRune('\n')
-	}
-	if m.lastMessage != "" {
-		b.WriteString("\n" + m.lastMessage)
-	}
-	return b.String()
-}
-
-func (m model) viewColorPicker() string {
-	col := "#000000"
-	if s := m.colorInput.Value(); len(s) == 7 && s[0] == '#' {
-		col = s
-	}
-	preview := lipgloss.NewStyle().
-		Background(lipgloss.Color(col)).
-		Width(2).Height(1).
-		Render("  ")
-
-	box := lipgloss.JoinHorizontal(lipgloss.Top, m.colorInput.View(), " ", preview)
-	dialog := lipgloss.Place(
-		int(m.width*2), int(m.height+4),
-		lipgloss.Center, lipgloss.Center,
-		lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(1).Render(
-			"Pick color (#RRGGBB):\n"+box+"\nPress Enter to confirm, Esc to cancel.",
-		),
-	)
-	return dialog
-}
-
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch m.currentMode {
-	case modeCanvas:
-		return m.updateCanvas(msg)
-	case modeColorPicker:
-		return m.updateColorPicker(msg)
-	}
-	return m, nil
-}
-
-func (m model) updateCanvas(msg tea.Msg) (tea.Model, tea.Cmd) {
-	count := m.countPrepend
-	if count == 0 {
-		count = 1
-	}
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "q", "ctrl+c":
-			return m, tea.Quit
-		case "0", "1", "2", "3", "4", "5", "6", "7", "8", "9":
-			num, _ := strconv.Atoi(msg.String())
-			m.countPrepend = m.countPrepend*10 + int16(num)
-		case "h", "left":
-			m.cursor.X -= count
-			m.countPrepend = 0
-		case "l", "right":
-			m.cursor.X += count
-			m.countPrepend = 0
-		case "k", "up":
-			m.cursor.Y -= count
-			m.countPrepend = 0
-		case "j", "down":
-			m.cursor.Y += count
-			m.countPrepend = 0
-		case " ", "enter":
-			m.countPrepend = 0
-			now := time.Now()
-			if last, ok := lastPlaced[m.username]; ok && now.Sub(last) < pixelRateLimit {
-				remaining := pixelRateLimit - now.Sub(last)
-				m.lastMessage = fmt.Sprintf("Rate limit: wait %ds", int(remaining.Seconds()))
-				return m, nil
-			}
-			m.currentMode = modeColorPicker
-			m.colorInput.SetValue("#")
-		}
-	case tea.WindowSizeMsg:
-		m.width, m.height = int16(msg.Width/2), int16(msg.Height-1)
-	}
-	return m, nil
-}
-
-func (m model) updateColorPicker(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmd tea.Cmd
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "esc":
-			m.currentMode = modeCanvas
-		case "enter":
-			val := m.colorInput.Value()
-			if len(val) == 7 && val[0] == '#' {
-				r, g, b := hexToRGB(val)
-				setPixel(m.cursor, Pixel{r, g, b})
-				lastPlaced[m.username] = time.Now()
-				m.lastMessage = ""
-				m.currentMode = modeCanvas
-			} else {
-				m.lastMessage = "Invalid color format."
-				m.currentMode = modeCanvas
-			}
-		}
-	case tea.WindowSizeMsg:
-		m.width, m.height = int16(msg.Width/2), int16(msg.Height-1)
-	}
-	m.colorInput, cmd = m.colorInput.Update(msg)
-	return m, cmd
-}
-
-func hexToRGB(hex string) (uint8, uint8, uint8) {
-	var r, g, b uint8
-	fmt.Sscanf(hex, "#%02x%02x%02x", &r, &g, &b)
-	return r, g, b
+	return tick()
 }
